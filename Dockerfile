@@ -1,21 +1,36 @@
-FROM node:16-alpine
+# Per https://bun.com/docs/guides/ecosystem/docker
+# use the official Bun image
+# see all versions at https://hub.docker.com/r/oven/bun/tags
+FROM oven/bun:1 AS base
+WORKDIR /usr/src/app
 
-WORKDIR /app
-COPY package.json .
-COPY package-lock.json .
+# install dependencies into temp directory
+# this will cache them and speed up future builds
+FROM base AS install
+RUN mkdir -p /temp/dev
+COPY package.json bun.lock /temp/dev/
+RUN cd /temp/dev && bun install --frozen-lockfile
 
-RUN npm ci
+# install with --production (exclude devDependencies)
+RUN mkdir -p /temp/prod
+COPY package.json bun.lock /temp/prod/
+RUN cd /temp/prod && bun install --frozen-lockfile --production
 
-COPY tsconfig.json .
-COPY src src
+# copy node_modules from temp directory
+# then copy all (non-ignored) project files into the image
+FROM base AS prerelease
+COPY --from=install /temp/dev/node_modules node_modules
+COPY . .
 
-# This is just to ensure everything compiles ahead of time.
-# We'll actually run using ts-node to ensure we get TypesScript
-# stack traces if something fails at runtime.
-RUN npm run typecheck
+RUN bun build --target=bun --production --outfile=dist/index.js src/index.ts
 
-EXPOSE 8100
+# copy production dependencies and source code into final image
+FROM base AS release
+COPY --from=install /temp/prod/node_modules node_modules
+COPY --from=prerelease /usr/src/app/dist/index.js .
+COPY --from=prerelease /usr/src/app/package.json .
 
-# We don't bother doing typechecking when we run (only TS->JS transpiling)
-# because we checked it above already. This uses less memory at runtime.
-CMD [ "npm", "run", "--silent", "start-no-typecheck" ]
+# run the app
+USER bun
+EXPOSE 8100/tcp
+ENTRYPOINT [ "bun", "run", "index.js" ]
