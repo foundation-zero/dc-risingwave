@@ -7,6 +7,7 @@ import {
   stringArrayEquals,
   ErrorWithStatusCode,
   mapObject,
+  zip,
 } from "./util";
 import type {
   Expression,
@@ -574,15 +575,13 @@ function target_query( // TODO: Rename as `target_query`
         ),
       ]
     : [];
-  // The use of the JSON function inside JSON_GROUP_ARRAY is necessary from SQLite 3.39.0 due to breaking changes in
-  // SQLite. See https://sqlite.org/forum/forumpost/e3b101fb3234272b for more details. This approach still works fine
-  // for older versions too.
+  const orderByInfo = orderBy(allRelationships, wOrder, target, tableAlias);
   const fieldSelect =
     fields === null
       ? []
-      : wOrder == null || wOrder.elements.length < 1
+      : orderByInfo == null
         ? [`'rows', JSONB_AGG(j)`]
-        : [`'rows', JSONB_AGG(j ORDER BY ord)`];
+        : [`'rows', JSONB_AGG(j ORDER BY ${orderByInfo.orderByUpper})`];
   const fieldFrom =
     fields === null
       ? ""
@@ -607,16 +606,10 @@ function target_query( // TODO: Rename as `target_query`
               wOffset,
             )})`;
           } else {
-            const orderByInfo = orderBy(
-              allRelationships,
-              wOrder,
-              target,
-              tableAlias,
-            );
             const orderByJoinClauses = orderByInfo?.joinClauses.join(" ") ?? "";
             const orderByClause = orderByInfo?.orderByClause ?? "";
 
-            return `FROM (SELECT ROW_NUMBER() OVER (PARTITION BY 1 ${orderByClause}) AS ord, ${json_object(
+            return `FROM (SELECT ${orderByInfo?.selectClauses ?? ""}${json_object(
               allRelationships,
               fields,
               target,
@@ -747,6 +740,8 @@ function orderDirection(orderDirection: OrderDirection): string {
 type OrderByInfo = {
   joinClauses: string[];
   orderByClause: string;
+  selectClauses: string;
+  orderByUpper: string;
 };
 
 function orderBy(
@@ -772,7 +767,7 @@ function orderBy(
       ),
   );
 
-  const orderByFragments = orderBy.elements.map((orderByElement) => {
+  const orderByExpressions = orderBy.elements.map((orderByElement) => {
     const targetTableAlias =
       orderByElement.target_path.length === 0
         ? queryTableAlias
@@ -795,19 +790,37 @@ function orderBy(
       orderByElement.target,
     );
 
-    const targetExpression =
-      orderByElement.target.type === "star_count_aggregate"
-        ? `COALESCE(${targetColumn}, 0)`
-        : targetColumn;
-
-    return `${targetExpression} ${orderDirection(
-      orderByElement.order_direction,
-    )}`;
+    return orderByElement.target.type === "star_count_aggregate"
+      ? `COALESCE(${targetColumn}, 0)`
+      : targetColumn;
   });
+  const orderByFragments = zip(orderBy.elements, orderByExpressions).map(
+    ([orderByElement, targetExpression]) => {
+      return `${targetExpression} ${orderDirection(
+        orderByElement.order_direction,
+      )}`;
+    },
+  );
+
+  const selectClauseFragments = orderByExpressions
+    .map((fragment, index) => {
+      return `${fragment} AS ${escapeIdentifier(`ord_${index}`)}`;
+    })
+    .join(", ");
+  const selectClauses = `${selectClauseFragments}, `;
+  const orderByUpper = orderBy.elements
+    .map((element, index) => {
+      return `${escapeIdentifier(`ord_${index}`)} ${orderDirection(
+        element.order_direction,
+      )}`;
+    })
+    .join(", ");
 
   return {
     joinClauses: joinInfos.map((joinInfo) => joinInfo.joinClause),
     orderByClause: tag("orderBy", `ORDER BY ${orderByFragments.join(",")}`),
+    selectClauses,
+    orderByUpper,
   };
 }
 
@@ -1275,52 +1288,6 @@ function tag(t: string, s: string): string {
   }
 }
 
-/** Performs a query and returns results
- *
- * Limitations:
- *
- * - Binary Array Operations not currently supported.
- *
- * The current algorithm is to first create a query, then execute it, returning results.
- *
- * Method for adding relationship fields:
- *
- * - JSON aggregation similar to Postgres' approach.
- *     - 4.13. The json_group_array() and json_group_object() aggregate SQL functions
- *     - https://www.sqlite.org/json1.html#jgrouparray
- *
-
-
- * Example of a test query:
- *
- * ```
- * query MyQuery {
- *   Artist(limit: 5, order_by: {ArtistId: asc}, where: {Name: {_neq: "Accept"}, _and: {Name: {_is_null: false}}}, offset: 3) {
- *     ArtistId
- *     Name
- *     Albums(where: {Title: {_is_null: false, _gt: "A", _nin: "foo"}}, limit: 2) {
- *       AlbumId
- *       Title
- *       ArtistId
- *       Tracks(limit: 1) {
- *         Name
- *         TrackId
- *       }
- *       Artist {
- *         ArtistId
- *       }
- *     }
- *   }
- *   Track(limit: 3) {
- *     Name
- *     Album {
- *       Title
- *     }
- *   }
- * }
- * ```
- *
- */
 export async function queryData(
   config: Config,
   sqlLogger: SqlLogger,
